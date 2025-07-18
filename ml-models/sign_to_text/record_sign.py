@@ -1,77 +1,135 @@
 import cv2
 import os
-import mediapipe as mp
 import numpy as np
 import time
+import mediapipe as mp
 
-DATA_PATH = 'data'
-NUM_FRAMES = 10
-SIGN_LABEL = input("Enter the sign label (e.g., hello, thanks): ").strip()
+# --- CONFIG ---
+SIGN_RECORD_SECONDS = 5
+TARGET_FPS = 10
+FRAMES_REQUIRED = SIGN_RECORD_SECONDS * TARGET_FPS
+MAX_MISSED_FRAMES = int(FRAMES_REQUIRED * 0.2)  # tolerate 20% missed frames
+HAND_SMOOTH_START = 5  # number of consistent frames before auto start
 
-if not SIGN_LABEL:
-    print("Label cannot be empty.")
-    exit(1)
+# --- PATH SETUP ---
+DATA_PATH = "data"
+sign_name = input("Enter the name of the sign to record: ").strip().lower()
+sign_dir = os.path.join(DATA_PATH, sign_name)
+os.makedirs(sign_dir, exist_ok=True)
+existing = [int(f.split('_')[-1].split('.')[0]) for f in os.listdir(sign_dir) if f.startswith("seq_")]
+sequence_num = max(existing, default=0) + 1
 
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.7)
-mp_draw = mp.solutions.drawing_utils
+# --- MEDIAPIPE SETUP ---
+from mediapipe.python.solutions.hands import Hands, HAND_CONNECTIONS
+from mediapipe.python.solutions.drawing_utils import draw_landmarks
 
+hands = Hands(
+    max_num_hands=2,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+
+def extract_landmarks(multi_hand_landmarks):
+    """Extract 2-hand landmarks (pad if 1 or 0)."""
+    keypoints = []
+    if multi_hand_landmarks:
+        for hand in multi_hand_landmarks[:2]:
+            pts = np.array([[lm.x, lm.y, lm.z] for lm in hand.landmark])
+            keypoints.append(pts.flatten())
+    while len(keypoints) < 2:
+        keypoints.append(np.zeros(63))  # 21 landmarks x 3 coords
+    return np.concatenate(keypoints)
+
+# --- CAMERA ---
 cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("[ERROR] Could not open webcam. Try changing the index to 1 or 2.")
-    exit(1)
+print(f"[INFO] Recording sign '{sign_name}' in {sign_dir}/seq_<n>.npy")
 
-print("Starting recording in 3 seconds...")
-time.sleep(3)
+buffer = []
+smooth_counter = 0
 
-sample_id = 0
-os.makedirs(f"{DATA_PATH}/{SIGN_LABEL}", exist_ok=True)
-
-while True:
-    keypoints_sequence = []
-    print(f"Recording sample {sample_id}...")
-
-    for _ in range(NUM_FRAMES):
+def record_sequence(cap, hands, sign_dir, sequence_num):
+    sequence = []
+    missed = 0
+    while len(sequence) < FRAMES_REQUIRED:
         ret, frame = cap.read()
         if not ret:
-            print("[ERROR] Failed to grab frame from webcam.")
             break
-
         frame = cv2.flip(frame, 1)
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = hands.process(frame_rgb)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(rgb)
 
-        keypoints = np.zeros(126)  # 2 hands * 21 landmarks * 3 (x,y,z)
+        if results.multi_hand_landmarks:
+            keypoints = extract_landmarks(results.multi_hand_landmarks)
+            sequence.append(keypoints)
+            for hand_landmarks in results.multi_hand_landmarks:
+                draw_landmarks(frame, hand_landmarks, HAND_CONNECTIONS)
+        else:
+            missed += 1
+            sequence.append(np.zeros(126))  # empty frame placeholder
 
-        if result.multi_hand_landmarks:
-            for hand_idx, hand_landmarks in enumerate(result.multi_hand_landmarks):
-                for i, lm in enumerate(hand_landmarks.landmark):
-                    if hand_idx == 0:
-                        keypoints[i*3:i*3+3] = [lm.x, lm.y, lm.z]
-                    elif hand_idx == 1:
-                        offset = 63
-                        keypoints[offset + i*3:offset + i*3+3] = [lm.x, lm.y, lm.z]
-                mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+        remaining = FRAMES_REQUIRED - len(sequence)
+        cv2.putText(frame, f"Recording... {remaining} frames left",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.imshow("Sign Recorder", frame)
+        if cv2.waitKey(int(1000 / TARGET_FPS)) & 0xFF == ord('q'):
+            raise KeyboardInterrupt
 
-        keypoints_sequence.append(keypoints)
-        cv2.putText(frame, f"Recording: {SIGN_LABEL} | Frame: {len(keypoints_sequence)}/{NUM_FRAMES}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.imshow("Recording", frame)
-
-        if cv2.waitKey(10) & 0xFF == ord('q'):
-            break
-
-    # Save sequence if correct number of frames
-    if len(keypoints_sequence) == NUM_FRAMES:
-        np.save(f"{DATA_PATH}/{SIGN_LABEL}/{SIGN_LABEL}_{sample_id}.npy", np.array(keypoints_sequence))
-        print(f"Saved {SIGN_LABEL}_{sample_id}.npy")
-        sample_id += 1
+    # Save only if enough valid frames
+    if missed <= MAX_MISSED_FRAMES:
+        np.save(os.path.join(sign_dir, f"seq_{sequence_num}.npy"), np.array(sequence))
+        print(f"[SAVED] Sequence #{sequence_num} with {missed} dropped frames.")
+        return True
     else:
-        print("Sample discarded (not enough frames).")
+        print(f"[SKIPPED] Too many missed frames: {missed}/{FRAMES_REQUIRED}")
+        return False
 
-    # Press Esc to quit
-    if cv2.waitKey(1) & 0xFF == 27:
-        break
+try:
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = cv2.flip(frame, 1)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(rgb)
 
-cap.release()
-cv2.destroyAllWindows()
+        # Start condition — hand detected for multiple consecutive frames
+        if results.multi_hand_landmarks:
+            smooth_counter += 1
+        else:
+            smooth_counter = 0
+
+        cv2.putText(frame, f"Waiting for hands... [{smooth_counter}/{HAND_SMOOTH_START}]",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        cv2.putText(frame, "Press 'm' to record manually", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 128, 255), 2)
+
+        # Start recording automatically
+        if smooth_counter >= HAND_SMOOTH_START:
+            print(f"[INFO] Starting auto recording for {SIGN_RECORD_SECONDS}s...")
+            success = record_sequence(cap, hands, sign_dir, sequence_num)
+            if success:
+                sequence_num += 1
+            smooth_counter = 0  # reset for next recording
+
+        # Show preview
+        if results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                draw_landmarks(frame, hand_landmarks, HAND_CONNECTIONS)
+        cv2.imshow("Sign Recorder", frame)
+
+        key = cv2.waitKey(10) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('m'):
+            print(f"[INFO] Manual recording started for {SIGN_RECORD_SECONDS}s...")
+            success = record_sequence(cap, hands, sign_dir, sequence_num)
+            if success:
+                sequence_num += 1
+            smooth_counter = 0  # reset for next recording
+
+except KeyboardInterrupt:
+    print("[STOPPED] Manually interrupted.")
+
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
+    hands.close()
